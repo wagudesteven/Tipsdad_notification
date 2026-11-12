@@ -31,14 +31,13 @@ jobs:
           key: tipsdad-state-${{ github.run_id }}
           restore-keys: tipsdad-state-
 
-      # Runs ~4.5 minutes, sending a notification every 30 seconds
-      # plus all the normal event notifications
+      # All event notifications + one "pulse" every 45 minutes
       - name: Send notifications
         env:
           FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           PULSE_TOPIC: ${{ vars.PULSE_TOPIC || 'tipsdad' }}
-          PULSE_EVERY_SECONDS: ${{ vars.PULSE_EVERY_SECONDS || '30' }}
+          PULSE_EVERY_MINUTES: ${{ vars.PULSE_EVERY_MINUTES || '45' }}
         run: python notify_loop.py
 
       # Save what was sent, even if the run failed or was stopped

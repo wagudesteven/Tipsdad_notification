@@ -81,6 +81,22 @@ LIBRARY: dict[str, list[tuple[str, str]]] = {
          "{n} games, {mins} minutes away. Your last look starts now."),
     ],
 
+    # ---------- Later today (kickoff more than 30 minutes away) ----------
+    "next_kickoff": [
+        ("Tonight's first whistle: {kickoff} ⚽",
+         "{ahead} matches still to come today. The analysis is ready on Tipsdad."),
+        ("Kickoff in {wait} ⏳",
+         "Plenty of time to read today's predictions. {ahead} matches ahead."),
+        ("Mark your calendar 📅",
+         "Next kickoff {kickoff}. Today's Tipsdad analysis is waiting for you."),
+        ("Matchday warm-up 🏃‍♂️",
+         "{ahead} games still to play today. Get ahead of them on Tipsdad."),
+        ("Plan your evening ⚽",
+         "First game at {kickoff}, {ahead} on the list. Open Tipsdad."),
+        ("The build-up starts now 🔥",
+         "Kickoff in {wait}. See what Tipsdad expects from today's matches."),
+    ],
+
     # ---------- Breaking: matches just kicked off ----------
     "live": [
         ("🚨 We're LIVE",
@@ -332,6 +348,7 @@ def _data(d: dict) -> dict:
         "kickoff": d.get("kickoff") or d.get("first_kickoff"),
         "mins": d.get("minutes_to_kickoff"),
         "ahead": d.get("matches_still_ahead_today"),
+        "wait": d.get("wait"),
         "wins": d.get("wins_now") or d.get("vip_wins_today"),
         "won": d.get("won"),
         "lost": d.get("lost"),
@@ -354,11 +371,12 @@ def candidates(event: str, d: dict, now: datetime | None = None,
     """Templates usable for this event and this data."""
     now = now or datetime.now()
     pool = list(LIBRARY.get(event, []))
-    if extra and event in ("tips_posted", "kickoff_soon", "live_update"):
+    if extra and event in ("tips_posted", "kickoff_soon", "next_kickoff",
+                           "live_update"):
         if now.weekday() >= 5:
             pool += WEEKEND
-    if extra and event in ("tips_posted", "kickoff_soon", "live",
-                           "live_update"):
+    if extra and event in ("tips_posted", "kickoff_soon", "next_kickoff",
+                           "live", "live_update"):
         pool += BIG_COMPETITION
     data = _data(d)
     return [t for t in pool if _fields(t) <= data.keys()]

@@ -143,7 +143,7 @@ def load_state(today: str) -> dict:
     # Kept across days (late matches finish after midnight)
     keep = {k: state.get(k) for k in
             ("won_ids", "settled_seen", "summaries", "settle_change",
-             "last_lapsed", "last_live_update")
+             "last_lapsed", "last_live_update", "last_pulse")
             if k in state}
     if state.get("date") != today:
         # New day: start fresh but remember recent wording + results
