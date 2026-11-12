@@ -5,7 +5,7 @@ on:
     - cron: "*/5 * * * *"     # every 5 minutes (GitHub's timer; can run late)
   workflow_dispatch:          # run by hand, or by cron-job.org (reliable timer)
 
-# Only one run at a time, so a notification is never sent twice
+# One run at a time, so nothing is sent twice
 concurrency:
   group: tipsdad-notify
   cancel-in-progress: false
@@ -13,7 +13,7 @@ concurrency:
 jobs:
   notify:
     runs-on: ubuntu-latest
-    timeout-minutes: 10       # was 4: busy runs need more time
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
@@ -31,11 +31,15 @@ jobs:
           key: tipsdad-state-${{ github.run_id }}
           restore-keys: tipsdad-state-
 
+      # Runs ~4.5 minutes, sending a notification every 30 seconds
+      # plus all the normal event notifications
       - name: Send notifications
         env:
           FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        run: python notify.py
+          PULSE_TOPIC: ${{ vars.PULSE_TOPIC || 'tipsdad' }}
+          PULSE_EVERY_SECONDS: ${{ vars.PULSE_EVERY_SECONDS || '30' }}
+        run: python notify_loop.py
 
       # Save what was sent, even if the run failed or was stopped
       - uses: actions/cache/save@v4
