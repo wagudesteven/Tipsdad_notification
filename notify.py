@@ -37,6 +37,8 @@ from zoneinfo import ZoneInfo
 
 import requests
 import firebase_admin
+
+import messages
 from firebase_admin import credentials, messaging
 
 # ============================================================
@@ -323,6 +325,9 @@ def write_message(event: str, details: dict, now: datetime,
         f"Details: {json.dumps(details, ensure_ascii=False)}\n"
         f"Recent notifications (do NOT repeat these):\n- "
         + "\n- ".join(recent[-12:] or ["(none)"])
+        + "\n\nTipsdad's house style (match this tone and energy; write "
+          "NEW wording, never copy these):\n"
+        + messages.examples(event)
     )
     if use_search:
         prompt += ("\n\nUse Google Search once to check what's trending "
@@ -362,7 +367,12 @@ def write_message(event: str, details: dict, now: datetime,
 
 
 def fallback(event: str, d: dict) -> dict:
-    """Ready-written messages: team names (allowed ones) or counts only."""
+    """Ready-written messages: team names (allowed ones) or counts only.
+    Uses the professional library in messages.py first."""
+    msg = messages.render(event, d, datetime.now(TZ))
+    if msg:
+        return msg
+
     names = d.get("matches_you_may_name") or []
     first = names[0] if names else None
     n = d.get("matches") or d.get("total_matches") or ""

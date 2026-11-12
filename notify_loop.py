@@ -22,6 +22,7 @@ from datetime import datetime, timedelta
 
 import firebase_admin
 
+import messages
 import notify
 
 # ============================================================
@@ -112,6 +113,10 @@ FALLBACK_PULSES = {
 
 
 def fallback_pulse(kind: str, d: dict) -> dict:
+    # Professional library first (weekend / big-competition aware)
+    msg = messages.render(kind, d, datetime.now(notify.TZ))
+    if msg:
+        return msg
     names = d.get("matches_you_may_name") or []
     title, body = random.choice(FALLBACK_PULSES[kind])
     fill = {
@@ -163,6 +168,16 @@ def main() -> None:
                 tips = [t for t in notify.load_recent_tips(now)
                         if t["day"] == now.strftime("%Y-%m-%d")]
                 picked = pulse_details(tips, now)
+                # About 1 in 5 pulses: banter or free-user engagement
+                if picked and random.random() < 0.2:
+                    extra = messages.extras(picked[1])
+                    if extra:
+                        notify.send(extra, "engagement",
+                                    f"'{PULSE_TOPIC}' in topics")
+                        recent = (recent + [f"{extra['title']} — "
+                                            f"{extra['body']}"])[-30:]
+                        pulses += 1
+                        picked = None
                 if picked:
                     kind, details = picked
                     if ai_used < AI_PULSES_PER_RUN:
