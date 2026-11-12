@@ -9,6 +9,7 @@ Run every 5 minutes (GitHub Actions or a cPanel cron). Each run:
        • "live"         – when that group of matches has kicked off
        • "won"          – as soon as tips are marked Won (batched)
        • "results"      – once ALL of a day's tips are settled: won/lost
+       • "live_update"  – every 45 minutes while any match is in play
   3. Every message is written fresh by Google Gemini (free tier), aware
      of weekends, universal festive days and football occasions.
 
@@ -30,6 +31,7 @@ import json
 import os
 import random
 import sys
+import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -57,6 +59,10 @@ SOON_WINDOW_MINUTES = 12    # "kickoff soon" when a match starts within this
 LIVE_WINDOW_MINUTES = 20    # "live" up to this long after kickoff
 MAX_PER_DAY = 14            # never send more than this in one day
 QUIET_HOURS = range(1, 7)   # no notifications 01:00–06:59 Nairobi time
+
+LIVE_UPDATE_EVERY_MINUTES = 45   # "matches still live" reminder interval
+MATCH_LENGTH_MINUTES = 110       # a match counts as in play this long
+MAX_LIVE_UPDATES_PER_DAY = 12    # separate from the other daily limits
 
 RESULTS_QUIET_MINUTES = 15  # results summary once statuses stop changing
 MAX_WIN_ALERTS_PER_DAY = 6  # "won" alerts per day (more go in the summary)
@@ -111,7 +117,13 @@ FEATURED_CATEGORIES = {"special"}
 # Most matches named in one notification
 MAX_NAMED_MATCHES = 3
 
+AI_TIMEOUT_SECONDS = 20    # max wait for one AI message
+AI_BUDGET_SECONDS = 90     # total AI time per run; after that, use the
+                           # ready-written messages so the run never stalls
+
 DRY_RUN = os.getenv("DRY_RUN") == "1"      # print instead of sending
+
+RUN_STARTED = time.monotonic()
 
 
 # ============================================================
@@ -129,7 +141,7 @@ def load_state(today: str) -> dict:
     # Kept across days (late matches finish after midnight)
     keep = {k: state.get(k) for k in
             ("won_ids", "settled_seen", "summaries", "settle_change",
-             "last_lapsed")
+             "last_lapsed", "last_live_update")
             if k in state}
     if state.get("date") != today:
         # New day: start fresh but remember recent wording + results
@@ -149,6 +161,8 @@ def load_state(today: str) -> dict:
     state.setdefault("sent_by_audience", {})  # audience -> count today
     state.setdefault("upsell_today", 0)
     state.setdefault("last_lapsed", None)     # date of last "renew" message
+    state.setdefault("last_live_update", None)  # time of last live update
+    state.setdefault("live_updates_today", 0)
 
     # Keep these lists small
     state["won_ids"] = state["won_ids"][-400:]
@@ -175,7 +189,10 @@ def kickoff_of(tip: dict):
     try:
         day, month, year = tip["date"].split()
         hour, minute = tip["time"].split(":")[:2]
-        return datetime(int(year), MONTHS[month.lower()], int(day),
+        m = month.lower()
+        m = MONTHS.get(m) or next(v for k, v in MONTHS.items()
+                                  if k.startswith(m[:3]))
+        return datetime(int(year), m, int(day),
                         int(hour), int(minute), tzinfo=TZ)
     except Exception:
         return None
@@ -184,7 +201,7 @@ def kickoff_of(tip: dict):
 def load_recent_tips(now: datetime) -> list[dict]:
     """Today's and yesterday's tips (yesterday for late results)."""
     res = requests.get(API_URL, headers={"Accept": "application/json"},
-                       timeout=45)
+                       timeout=30)
     res.raise_for_status()
     body = res.json()
 
@@ -257,6 +274,9 @@ Rules:
 - Otherwise talk in counts and times (e.g. "6 matches kick off at 21:00").
 - For "won" events you may say the named matches' tips WON (✅), but
   never say what the tip was.
+- "live_update" is a reminder sent while matches are still being played:
+  say how many are live right now and name the allowed ones. Fresh,
+  exciting wording each time ("still on", "second half", "tense finish").
 - For "results" events report the real numbers exactly (won and lost).
   Be honest about losses, never hide or spin them; keep the energy by
   pointing to the next tips ("next tips drop soon, stay ready").
@@ -291,6 +311,11 @@ def write_message(event: str, details: dict, now: datetime,
     if not api_key:
         return fallback(event, details)
 
+    # Out of AI time for this run: use a ready-written message
+    if time.monotonic() - RUN_STARTED > AI_BUDGET_SECONDS:
+        print("AI time budget used up, using fallback")
+        return fallback(event, details)
+
     prompt = (
         f"Event: {event}\n"
         f"Now: {now:%A %d %B %Y, %H:%M}\n"
@@ -319,7 +344,7 @@ def write_message(event: str, details: dict, now: datetime,
             GEMINI_URL.format(model=AI_MODEL),
             params={"key": api_key},
             json=payload,
-            timeout=40,
+            timeout=AI_TIMEOUT_SECONDS,
         )
         res.raise_for_status()
         parts = res.json()["candidates"][0]["content"]["parts"]
@@ -405,6 +430,18 @@ def fallback(event: str, d: dict) -> dict:
              f"{d.get('vip_wins_today', '')} VIP wins today. "
              "Come back and renew your package."),
         ]
+    elif event == "live_update":
+        live_n = d.get("live_now", n)
+        options = [
+            ("Still live 🔴⚽",
+             (f"{first} and {live_n - 1} more are on now"
+              if first and live_n > 1 else
+              f"{first} is still on" if first else
+              f"{live_n} match(es) still live")
+             + ". Follow them on Tipsdad 🔥"),
+            ("Games in play 🔥",
+             f"{live_n} match(es) live right now. Don't miss the finish!"),
+        ]
     elif event == "results":
         options = [
             ("Results are in 📊",
@@ -434,7 +471,12 @@ def init_firebase() -> None:
     raw = os.getenv("FIREBASE_SERVICE_ACCOUNT")
     if not raw:
         sys.exit("FIREBASE_SERVICE_ACCOUNT is not set")
-    cred = credentials.Certificate(json.loads(raw))
+    try:
+        key = json.loads(raw.strip().lstrip("\ufeff"))
+    except json.JSONDecodeError:
+        sys.exit("FIREBASE_SERVICE_ACCOUNT is not valid JSON. Paste the "
+                 "ENTIRE contents of the Firebase key file.")
+    cred = credentials.Certificate(key)
     firebase_admin.initialize_app(cred)
 
 
@@ -490,6 +532,8 @@ def main() -> None:
             state["sent_by_audience"].get(audience, 0) + 1
         state["recent_messages"] = (state["recent_messages"] +
                                     [f"{msg['title']} — {msg['body']}"])[-20:]
+        # Save now, so a stopped run never sends this one again
+        save_state(state)
 
     def by_package(items: list[dict]) -> dict[str, list[dict]]:
         """VIP tips grouped by package entitlement."""
@@ -548,9 +592,9 @@ def main() -> None:
         soon_key = f"soon:{kickoff:%H%M}"
         if 0 < minutes <= SOON_WINDOW_MINUTES and soon_key not in \
                 state["sent_keys"] and can_send():
-            do_send("kickoff_soon⌛", soon_key, {
+            do_send("kickoff_soon", soon_key, {
                 **base,
-                "minutes_to_kickoff⌛": round(minutes),
+                "minutes_to_kickoff": round(minutes),
                 "matches_you_may_name": match_names(group_featured),
             })
 
@@ -603,6 +647,9 @@ def main() -> None:
     new_wins = [t for t in recent_tips
                 if t["won"] and str(t["id"]) not in state["won_ids"]]
     if new_wins:
+        # Remember these wins first, so a stopped run can't repeat them
+        state["won_ids"] += [str(t["id"]) for t in new_wins]
+        save_state(state)
         stamp = f"won:{now:%H%M}:{len(new_wins)}"
         featured_first = sorted(new_wins, key=lambda t: not t["is_featured"])
 
@@ -661,8 +708,34 @@ def main() -> None:
             }, condition=LAPSED, audience="lapsed")
             state["last_lapsed"] = now.isoformat()
 
-        # Remember them either way (extra wins go in the summary)
-        state["won_ids"] += [str(t["id"]) for t in new_wins]
+
+    # ---------- 4b. Live update every 45 minutes ----------
+    # Any match kicked off in the last ~110 min and not settled yet
+    in_play = [t for t in tips
+               if t["kickoff"] <= now
+               < t["kickoff"] + timedelta(minutes=MATCH_LENGTH_MINUTES)
+               and not t["settled"]]
+    last_upd = state["last_live_update"]
+    upd_due = (last_upd is None or now - datetime.fromisoformat(last_upd)
+               >= timedelta(minutes=LIVE_UPDATE_EVERY_MINUTES))
+    if (in_play and upd_due
+            and state["live_updates_today"] < MAX_LIVE_UPDATES_PER_DAY
+            and now.hour not in QUIET_HOURS):
+        # Skip if a kickoff "live" alert just went out in this run
+        just_live = any(f"live:{t['kickoff']:%H%M}" in state["sent_keys"]
+                        and now - t["kickoff"] < timedelta(minutes=10)
+                        for t in in_play)
+        if not just_live:
+            order = sorted(in_play, key=lambda t: not t["is_featured"])
+            do_send("live_update", f"live_update:{now:%H%M}", {
+                "live_now": len(in_play),
+                "leagues": sorted({t["league"] for t in in_play
+                                   if t["league"]})[:4],
+                "matches_you_may_name": match_names(order),
+            }, audience="live_update")
+        # Start the 45-minute clock either way
+        state["last_live_update"] = now.isoformat()
+        state["live_updates_today"] += 1 if not just_live else 0
 
     # ---------- 5. Results summary (after ALL tips are settled) ----------
     days: dict[str, list[dict]] = {}
@@ -715,6 +788,21 @@ def main() -> None:
                               if k in days}
 
     save_state(state)
+
+    # ---------- Status report (shows in the GitHub Actions log) ----------
+    upcoming_k = sorted({t["kickoff"] for t in tips if t["kickoff"] > now})
+    print(f"Now (Nairobi): {now:%a %d %b %H:%M}"
+          f"{'  [QUIET HOURS: nothing is sent]' if now.hour in QUIET_HOURS else ''}")
+    print(f"Tips from API: {len(recent_tips)} today+yesterday, "
+          f"{len(tips)} today, {len(in_play)} in play now, "
+          f"{len(upcoming_k)} kickoff times still ahead")
+    if upcoming_k:
+        print("Next kickoffs: " + ", ".join(f"{k:%H:%M}" for k in upcoming_k[:6]))
+    if state["last_live_update"]:
+        print(f"Last live update: {state['last_live_update'][11:16]} "
+              f"(next one {LIVE_UPDATE_EVERY_MINUTES} min later, if games are on)")
+    print(f"Sent today: {state['sent_today']}  "
+          f"(by audience: {state['sent_by_audience'] or '-'})")
     print(f"Done. {len(tips)} tips today, {state['sent_today']} sent today.")
 
 
