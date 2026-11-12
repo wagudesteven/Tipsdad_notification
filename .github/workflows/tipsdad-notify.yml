@@ -2,9 +2,10 @@ name: Tipsdad notifications
 
 on:
   schedule:
-    - cron: "*/5 * * * *"     # every 5 minutes
-  workflow_dispatch:          # run by hand from the Actions tab
+    - cron: "*/5 * * * *"     # every 5 minutes (GitHub's timer; can run late)
+  workflow_dispatch:          # run by hand, or by cron-job.org (reliable timer)
 
+# Only one run at a time, so a notification is never sent twice
 concurrency:
   group: tipsdad-notify
   cancel-in-progress: false
@@ -12,7 +13,7 @@ concurrency:
 jobs:
   notify:
     runs-on: ubuntu-latest
-    timeout-minutes: 4
+    timeout-minutes: 10       # was 4: busy runs need more time
     steps:
       - uses: actions/checkout@v4
 
@@ -23,7 +24,7 @@ jobs:
 
       - run: pip install -r requirements.txt
 
-      # Remember what was already sent today
+      # Load what was already sent (from the previous run)
       - uses: actions/cache/restore@v4
         with:
           path: state.json
@@ -36,6 +37,7 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: python notify.py
 
+      # Save what was sent, even if the run failed or was stopped
       - uses: actions/cache/save@v4
         if: always()
         with:

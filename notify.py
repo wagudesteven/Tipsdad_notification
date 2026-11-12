@@ -7,7 +7,7 @@ Run every 5 minutes (GitHub Actions or a cPanel cron). Each run:
        • "tips posted"  – once today's tips stop changing for a while
        • "kickoff soon" – shortly before a group of matches kicks off
        • "live"         – when that group of matches has kicked off
-       • "won"          – as soon as tips are marked Won (batched)
+       • "won"          – as soon as TODAY's tips are marked Won (batched)
        • "results"      – once ALL of a day's tips are settled: won/lost
        • "live_update"  – every 45 minutes while any match is in play
   3. Every message is written fresh by Google Gemini (free tier), aware
@@ -642,9 +642,10 @@ def main() -> None:
                 state["sent_keys"].append(soon_key)
 
     # ---------- 4. Won (as soon as tips are marked Won) ----------
+    # TODAY's tips only (yesterday's wins are never announced).
     # Several wins found in one check go out as ONE notification
     # per audience.
-    new_wins = [t for t in recent_tips
+    new_wins = [t for t in tips
                 if t["won"] and str(t["id"]) not in state["won_ids"]]
     if new_wins:
         # Remember these wins first, so a stopped run can't repeat them
