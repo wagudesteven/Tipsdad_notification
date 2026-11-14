@@ -3,13 +3,13 @@ Tipsdad automatic push notifications.
 
 Run every 5 minutes (GitHub Actions or a cPanel cron). Each run:
   1. Loads today's tips from the Tipsdad API.
-  2. Sends at most one notification per event:
+  2. Every 45 minutes a cycle of up to 3 notifications, 15 minutes apart:
+       +0  "won" (tips that WON since the last cycle) or "confidence" (real record)
+       +15 "live_update" / "kickoff_soon" / "next_kickoff"
+       +30 an AI football fact about one of today's games (notify_loop.py)
+     Plus two once-a-day messages, sent when they happen:
        • "tips posted"  – once today's tips stop changing for a while
-       • "kickoff soon" – shortly before a group of matches kicks off
-       • "live"         – when that group of matches has kicked off
-       • "won"          – as soon as TODAY's tips are marked Won (batched)
        • "results"      – once ALL of a day's tips are settled: won/lost
-       • "live_update"  – every 45 minutes while any match is in play
   3. Every message is written fresh by Google Gemini (free tier), aware
      of weekends, universal festive days and football occasions.
 
@@ -59,12 +59,20 @@ GEMINI_URL = ("https://generativelanguage.googleapis.com/v1beta/models/"
 POSTED_QUIET_MINUTES = 20   # "tips posted" once no new tips for this long
 SOON_WINDOW_MINUTES = 12    # "kickoff soon" when a match starts within this
 LIVE_WINDOW_MINUTES = 20    # "live" up to this long after kickoff
-MAX_PER_DAY = 14            # never send more than this in one day
+MAX_PER_DAY = int(os.getenv("MAX_PER_DAY", "30"))  # cap per audience per day
 QUIET_HOURS = range(1, 7)   # no notifications 01:00–06:59 Nairobi time
 
-LIVE_UPDATE_EVERY_MINUTES = 45   # "matches still live" reminder interval
+# Every cycle sends up to 3 notifications, spaced out:
+#   +0 min  results update (wins since last cycle, else today's record)
+#   +15 min live update    (live now / kicking off soon / next kickoff)
+#   +30 min football fact  (AI, in notify_loop.py)
+PULSE_EVERY_MINUTES = int(os.getenv("PULSE_EVERY_MINUTES", "45"))
+LIVE_SLOT_MINUTES = 15
+FACT_SLOT_MINUTES = 30
+PULSE_SLACK_MINUTES = 3          # runs are every 5 min, so allow a little early
 MATCH_LENGTH_MINUTES = 110       # a match counts as in play this long
-MAX_LIVE_UPDATES_PER_DAY = 12    # separate from the other daily limits
+MAX_CONFIDENCE_PER_DAY = 10      # "here's our record" when no new wins this cycle
+SEND_KICKOFF_ALERTS = False      # True = ALSO send "kickoff soon"/"live" right at kickoff
 
 RESULTS_QUIET_MINUTES = 15  # results summary once statuses stop changing
 MAX_WIN_ALERTS_PER_DAY = 6  # "won" alerts per day (more go in the summary)
@@ -143,7 +151,8 @@ def load_state(today: str) -> dict:
     # Kept across days (late matches finish after midnight)
     keep = {k: state.get(k) for k in
             ("won_ids", "settled_seen", "summaries", "settle_change",
-             "last_lapsed", "last_live_update", "last_pulse")
+             "last_lapsed", "last_pulse", "last_results_at", "cycle",
+             "fact_history")
             if k in state}
     if state.get("date") != today:
         # New day: start fresh but remember recent wording + results
@@ -163,8 +172,8 @@ def load_state(today: str) -> dict:
     state.setdefault("sent_by_audience", {})  # audience -> count today
     state.setdefault("upsell_today", 0)
     state.setdefault("last_lapsed", None)     # date of last "renew" message
-    state.setdefault("last_live_update", None)  # time of last live update
-    state.setdefault("live_updates_today", 0)
+    state.setdefault("last_pulse", None)     # time of the last 45-min pulse
+    state.setdefault("confidence_today", 0)
 
     # Keep these lists small
     state["won_ids"] = state["won_ids"][-400:]
@@ -279,6 +288,15 @@ Rules:
 - "live_update" is a reminder sent while matches are still being played:
   say how many are live right now and name the allowed ones. Fresh,
   exciting wording each time ("still on", "second half", "tense finish").
+- "won", "vip_won", "live_update" and "vip_live" may include "record_today"
+  (won/lost so far) and "starting_soon": mention them briefly when they help.
+- "next_kickoff" is a countdown to today's next match when nothing is live:
+  use "kickoff" and "wait" (e.g. "first whistle in 2h 15m"), counts only.
+- "confidence" is sent when nothing new happened in the last 45 minutes:
+  build trust with the REAL record in the details (today so far, yesterday,
+  current win streak, matches still to play). Use the exact numbers. If
+  losses outnumber wins, don't hide them: talk about transparency instead
+  ("every result is in History") and the next matches. Never promise wins.
 - For "results" events report the real numbers exactly (won and lost).
   Be honest about losses, never hide or spin them; keep the energy by
   pointing to the next tips ("next tips drop soon, stay ready").
@@ -306,6 +324,13 @@ Rules:
   reference it briefly. Don't make up facts."""
 
 
+def _examples(event: str) -> str:
+    try:
+        return messages.examples(event) or "(none)"
+    except Exception:
+        return "(none)"
+
+
 def write_message(event: str, details: dict, now: datetime,
                   recent: list[str], use_search: bool) -> dict:
     """Ask Gemini (free) for a fresh title/body. Falls back to a template."""
@@ -327,7 +352,7 @@ def write_message(event: str, details: dict, now: datetime,
         + "\n- ".join(recent[-12:] or ["(none)"])
         + "\n\nTipsdad's house style (match this tone and energy; write "
           "NEW wording, never copy these):\n"
-        + messages.examples(event)
+        + _examples(event)
     )
     if use_search:
         prompt += ("\n\nUse Google Search once to check what's trending "
@@ -369,7 +394,10 @@ def write_message(event: str, details: dict, now: datetime,
 def fallback(event: str, d: dict) -> dict:
     """Ready-written messages: team names (allowed ones) or counts only.
     Uses the professional library in messages.py first."""
-    msg = messages.render(event, d, datetime.now(TZ))
+    try:
+        msg = messages.render(event, d, datetime.now(TZ))
+    except Exception:
+        msg = None
     if msg:
         return msg
 
@@ -441,7 +469,7 @@ def fallback(event: str, d: dict) -> dict:
              "Come back and renew your package."),
         ]
     elif event == "live_update":
-        live_n = d.get("live_now", n)
+        live_n = d.get("live_now", n) or n or 1
         options = [
             ("Still live 🔴⚽",
              (f"{first} and {live_n - 1} more are on now"
@@ -452,6 +480,44 @@ def fallback(event: str, d: dict) -> dict:
             ("Games in play 🔥",
              f"{live_n} match(es) live right now. Don't miss the finish!"),
         ]
+    elif event == "next_kickoff":
+        options = [
+            ("Next kickoff ⏱",
+             (f"{first} and more kick off" if first else f"{n} match(es) kick off")
+             + f" at {d.get('kickoff', '')}. Open Tipsdad."),
+            ("Coming up ⚽",
+             f"{n} match(es) start in {d.get('wait', '')} "
+             f"({d.get('kickoff', '')}). Get ready on Tipsdad."),
+        ]
+    elif event == "engagement":
+        options = [
+            ("Today on Tipsdad ⚽",
+             f"{n} matches on today's list. Open Tipsdad."),
+            ("Have you checked today's tips?",
+             f"{n} matches lined up, first kickoff {d.get('kickoff', '')}."),
+        ]
+    elif event == "confidence":
+        tw, tl = d.get("today_won", 0), d.get("today_lost", 0)
+        yw, yl = d.get("yesterday_won", 0), d.get("yesterday_lost", 0)
+        streak = d.get("win_streak", 0)
+        left = d.get("matches_still_to_play", 0)
+        options = []
+        if tw + tl:
+            options.append(("Today so far 📊",
+                             f"{tw} won, {tl} lost"
+                             + (f", {left} still to play" if left else "")
+                             + ". Every result is in History on Tipsdad."))
+        if yw + yl:
+            options.append(("Yesterday's record ✅",
+                            f"{yw} won, {yl} lost. All results are public in History."))
+        if streak >= 2:
+            options.append((f"{streak} wins in a row 🔥",
+                            "Our last results are all green. Check History on Tipsdad."))
+        if left:
+            options.append(("More matches ahead ⚽",
+                            f"{left} matches still to play today. Stay with Tipsdad."))
+        if not options:
+            options = [("Stay ready ⚽", "New tips drop soon on Tipsdad. Turn notifications on.")]
     elif event == "results":
         options = [
             ("Results are in 📊",
@@ -510,6 +576,205 @@ def send(msg: dict, event: str, condition: str) -> None:
         ),
     )
     print(f"Sent {event}: {messaging.send(message)} | {msg['title']}")
+
+
+# ============================================================
+# 45-MINUTE PULSE
+# ============================================================
+
+def in_play_now(tips: list[dict], now: datetime) -> list[dict]:
+    """Kicked off less than MATCH_LENGTH_MINUTES ago and not settled yet."""
+    return [t for t in tips
+            if t["kickoff"] <= now
+            < t["kickoff"] + timedelta(minutes=MATCH_LENGTH_MINUTES)
+            and not t["settled"]]
+
+
+def record_of(items: list[dict]) -> dict:
+    won = sum(1 for t in items if t["won"])
+    lost = sum(1 for t in items if t["lost"])
+    return {"won": won, "lost": lost}
+
+
+def win_streak(recent_tips: list[dict]) -> int:
+    """Wins in a row, newest settled tip first (void/postponed are skipped)."""
+    streak = 0
+    for t in sorted(recent_tips, key=lambda t: t["kickoff"], reverse=True):
+        if t["won"]:
+            streak += 1
+        elif t["lost"]:
+            break
+    return streak
+
+
+def slot_results(now, tips, recent_tips, state, can_send, do_send,
+                 by_package) -> None:
+    """+0 min: wins since the last cycle; if none, today's real record."""
+    stamp = f"cycle:{now:%Y%m%d%H%M}"
+    yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+    in_play = in_play_now(tips, now)
+    today_rec = record_of(tips)
+
+    new_wins = [t for t in tips
+                if t["won"] and str(t["id"]) not in state["won_ids"]]
+    if new_wins:
+        state["won_ids"] += [str(t["id"]) for t in new_wins]
+        save_state(state)
+        featured_first = sorted(new_wins, key=lambda t: not t["is_featured"])
+
+        if (state["win_alerts_today"] < MAX_WIN_ALERTS_PER_DAY
+                and can_send("non_vip")):
+            do_send("won", f"{stamp}:won", {
+                "wins_now": len(new_wins),
+                "matches_you_may_name": match_names(featured_first),
+                "wins_so_far_today": today_rec["won"],
+                "record_today": today_rec,
+                "live_now": len(in_play),
+            }, condition=NON_VIP, audience="non_vip")
+            state["win_alerts_today"] += 1
+
+        vip_wins = [t for t in featured_first if t["entitlement"]]
+        win_groups = by_package(vip_wins)
+
+        if vip_wins and can_send("combined"):
+            do_send("vip_won", f"{stamp}:won:{COMBINED}", {
+                "wins_now": len(vip_wins),
+                "package": PACKAGE_NAME[COMBINED],
+                "matches_you_may_name": match_names(vip_wins),
+                "record_today": record_of([t for t in tips if t["entitlement"]]),
+            }, condition=COMBINED_SUBS, audience="combined")
+
+        for ent, pkg_wins in win_groups.items():
+            if can_send(ent):
+                do_send("vip_won", f"{stamp}:won:{ent}", {
+                    "wins_now": len(pkg_wins),
+                    "package": PACKAGE_NAME[ent],
+                    "matches_you_may_name": match_names(pkg_wins),
+                    "record_today": record_of(
+                        [t for t in tips if t["entitlement"] == ent]),
+                }, condition=package_subs(ent), audience=ent)
+
+        # Upgrade to VIP Combined (once a day)
+        if win_groups and state["upsell_today"] < MAX_UPSELL_PER_DAY \
+                and can_send("upsell"):
+            ent, pkg_wins = max(win_groups.items(), key=lambda kv: len(kv[1]))
+            do_send("upsell", f"{stamp}:upsell:{ent}", {
+                "package": PACKAGE_NAME[ent],
+                "wins_now": len(pkg_wins),
+                "matches_you_may_name": match_names(pkg_wins),
+            }, condition=upsell_for(ent), audience="upsell")
+            state["upsell_today"] += 1
+
+        # Renew VIP (expired subscribers, at most every N days)
+        last = state["last_lapsed"]
+        due = (last is None or
+               (now.date() - datetime.fromisoformat(last).date()).days
+               >= LAPSED_EVERY_DAYS)
+        vip_wins_today = sum(1 for t in tips if t["won"] and t["entitlement"])
+        if vip_wins and due and vip_wins_today >= 2 and can_send("lapsed"):
+            do_send("resubscribe", f"{stamp}:lapsed", {
+                "vip_wins_today": vip_wins_today,
+                "matches_you_may_name": match_names(vip_wins),
+            }, condition=LAPSED, audience="lapsed")
+            state["last_lapsed"] = now.isoformat()
+        return
+
+    # No new wins: build confidence with the real record
+    last_res = state.get("last_results_at")
+    if last_res and now - datetime.fromisoformat(last_res) \
+            < timedelta(minutes=PULSE_EVERY_MINUTES):
+        return   # the results summary just went out
+    if state["confidence_today"] >= MAX_CONFIDENCE_PER_DAY \
+            or not can_send("confidence"):
+        return
+    y_rec = record_of([t for t in recent_tips if t["day"] == yesterday])
+    still_to_play = sum(1 for t in tips if t["kickoff"] > now)
+    if today_rec["won"] + today_rec["lost"] + y_rec["won"] + y_rec["lost"] == 0:
+        return   # no record yet: the live slot covers today's matches
+    do_send("confidence", f"{stamp}:confidence", {
+        "today_won": today_rec["won"],
+        "today_lost": today_rec["lost"],
+        "yesterday_won": y_rec["won"],
+        "yesterday_lost": y_rec["lost"],
+        "win_streak": win_streak(recent_tips),
+        "matches_still_to_play": still_to_play,
+        # only winning, already-finished matches may be named
+        "matches_you_may_name": match_names(sorted(
+            [t for t in tips if t["won"]], key=lambda t: not t["is_featured"])),
+    }, audience="confidence")
+    state["confidence_today"] += 1
+
+
+def slot_live(now, tips, state, can_send, do_send, by_package) -> None:
+    """+15 min: matches live now; else kicking off before the next cycle;
+    else the next kickoff later today."""
+    stamp = f"cycle:{now:%Y%m%d%H%M}"
+    in_play = in_play_now(tips, now)
+    soon = [t for t in tips if now < t["kickoff"]
+            <= now + timedelta(minutes=PULSE_EVERY_MINUTES)]
+    later = sorted((t for t in tips if t["kickoff"] > now),
+                   key=lambda t: t["kickoff"])
+
+    def send_for(items, audience, condition, live_event, package=None) -> bool:
+        if not can_send(audience):
+            return False
+        extra = {"package": package} if package else {}
+        live = [t for t in in_play if t in items]
+        nxt = [t for t in soon if t in items]
+        if live:
+            order = sorted(live, key=lambda t: not t["is_featured"])
+            do_send(live_event, f"{stamp}:live:{audience}", {
+                **extra,
+                "live_now": len(live),
+                "matches": len(live),
+                "starting_soon": len(nxt),
+                "leagues": sorted({t["league"] for t in live if t["league"]})[:4],
+                "matches_you_may_name": match_names(order),   # live games
+                "record_today": record_of(items),
+            }, condition=condition, audience=audience)
+            return True
+        if nxt:
+            first = min(t["kickoff"] for t in nxt)
+            do_send("kickoff_soon", f"{stamp}:soon:{audience}", {
+                **extra,
+                "matches": len(nxt),
+                "kickoff": f"{first:%H:%M}",
+                "minutes_to_kickoff": max(1, round((first - now).total_seconds() / 60)),
+                "leagues": sorted({t["league"] for t in nxt if t["league"]})[:4],
+                # before kickoff only FEATURED games may be named
+                "matches_you_may_name": match_names(
+                    [t for t in nxt if t["is_featured"]]),
+            }, condition=condition, audience=audience)
+            return True
+        return False
+
+    told = False
+    if in_play or soon:
+        told |= send_for(tips, "non_vip", NON_VIP, "live_update")
+        vip_today = [t for t in tips if t["entitlement"]]
+        if vip_today:
+            told |= send_for(vip_today, "combined", COMBINED_SUBS, "vip_live",
+                             PACKAGE_NAME[COMBINED])
+        for ent, pkg_tips in by_package(vip_today).items():
+            told |= send_for(pkg_tips, ent, package_subs(ent), "vip_live",
+                             PACKAGE_NAME[ent])
+
+    # Nothing live or about to start: countdown to the next kickoff today
+    if not told and later and can_send("all"):
+        nxt = later[0]["kickoff"]
+        group = [t for t in later if t["kickoff"] == nxt]
+        mins = max(1, round((nxt - now).total_seconds() / 60))
+        hours, rest = divmod(mins, 60)
+        do_send("next_kickoff", f"{stamp}:next", {
+            "matches": len(group),
+            "kickoff": f"{nxt:%H:%M}",
+            "minutes_to_kickoff": mins,
+            "wait": f"{hours}h {rest}m" if hours else f"{rest} min",
+            "matches_still_ahead_today": len(later),
+            "leagues": sorted({t["league"] for t in group if t["league"]})[:4],
+            "matches_you_may_name": match_names(
+                [t for t in group if t["is_featured"]]),
+        })
 
 
 # ============================================================
@@ -587,7 +852,7 @@ def main() -> None:
     for t in tips:
         groups.setdefault(t["kickoff"], []).append(t)
 
-    for kickoff, group in sorted(groups.items()):
+    for kickoff, group in (sorted(groups.items()) if SEND_KICKOFF_ALERTS else []):
         minutes = (kickoff - now).total_seconds() / 60
         group_featured = [t for t in group if t["is_featured"]]
         base = {
@@ -651,102 +916,26 @@ def main() -> None:
             if soon_key not in state["sent_keys"]:
                 state["sent_keys"].append(soon_key)
 
-    # ---------- 4. Won (as soon as tips are marked Won) ----------
-    # TODAY's tips only (yesterday's wins are never announced).
-    # Several wins found in one check go out as ONE notification
-    # per audience.
-    new_wins = [t for t in tips
-                if t["won"] and str(t["id"]) not in state["won_ids"]]
-    if new_wins:
-        # Remember these wins first, so a stopped run can't repeat them
-        state["won_ids"] += [str(t["id"]) for t in new_wins]
-        save_state(state)
-        stamp = f"won:{now:%H%M}:{len(new_wins)}"
-        featured_first = sorted(new_wins, key=lambda t: not t["is_featured"])
+    # ---------- 4. The 45-minute cycle (slots +0 and +15; +30 is notify_loop.py) ----------
+    if now.hour not in QUIET_HOURS:
+        cyc = state.get("cycle") or {}
+        start = datetime.fromisoformat(cyc["at"]) if cyc.get("at") else None
+        if start is None or now - start >= timedelta(
+                minutes=PULSE_EVERY_MINUTES - PULSE_SLACK_MINUTES):
+            start, cyc = now, {"at": now.isoformat(), "done": []}
+        mins = (now - start).total_seconds() / 60
+        state["cycle"] = cyc
 
-        # a) Non-VIP users: general win alert
-        if (state["win_alerts_today"] < MAX_WIN_ALERTS_PER_DAY
-                and can_send("non_vip")):
-            do_send("won", stamp, {
-                "wins_now": len(new_wins),
-                "matches_you_may_name": match_names(featured_first),
-                "wins_so_far_today": sum(1 for t in tips if t["won"]),
-            }, condition=NON_VIP, audience="non_vip")
-            state["win_alerts_today"] += 1
-
-        vip_wins = [t for t in featured_first if t["entitlement"]]
-        win_groups = by_package(vip_wins)
-
-        # b) VIP Combined: one alert for all their wins
-        if vip_wins and can_send("combined"):
-            do_send("vip_won", f"{stamp}:{COMBINED}", {
-                "wins_now": len(vip_wins),
-                "package": PACKAGE_NAME[COMBINED],
-                "matches_you_may_name": match_names(vip_wins),
-            }, condition=COMBINED_SUBS, audience="combined")
-
-        # c) Each package's subscribers: their wins
-        for ent, pkg_wins in win_groups.items():
-            if can_send(ent):
-                do_send("vip_won", f"{stamp}:{ent}", {
-                    "wins_now": len(pkg_wins),
-                    "package": PACKAGE_NAME[ent],
-                    "matches_you_may_name": match_names(pkg_wins),
-                }, condition=package_subs(ent), audience=ent)
-
-        # d) Upgrade to VIP Combined: users with ANOTHER package
-        #    (once a day, for the package with the most new wins)
-        if win_groups and state["upsell_today"] < MAX_UPSELL_PER_DAY \
-                and can_send("upsell"):
-            ent, pkg_wins = max(win_groups.items(), key=lambda kv: len(kv[1]))
-            do_send("upsell", f"{stamp}:upsell:{ent}", {
-                "package": PACKAGE_NAME[ent],
-                "wins_now": len(pkg_wins),
-                "matches_you_may_name": match_names(pkg_wins),
-            }, condition=upsell_for(ent), audience="upsell")
-            state["upsell_today"] += 1
-
-        # e) Renew VIP: expired subscribers (at most every N days)
-        last = state["last_lapsed"]
-        due = (last is None or
-               (now.date() - datetime.fromisoformat(last).date()).days
-               >= LAPSED_EVERY_DAYS)
-        vip_wins_today = sum(1 for t in tips if t["won"] and t["entitlement"])
-        if vip_wins and due and vip_wins_today >= 2 and can_send("lapsed"):
-            do_send("resubscribe", f"{stamp}:lapsed", {
-                "vip_wins_today": vip_wins_today,
-                "matches_you_may_name": match_names(vip_wins),
-            }, condition=LAPSED, audience="lapsed")
-            state["last_lapsed"] = now.isoformat()
-
-
-    # ---------- 4b. Live update every 45 minutes ----------
-    # Any match kicked off in the last ~110 min and not settled yet
-    in_play = [t for t in tips
-               if t["kickoff"] <= now
-               < t["kickoff"] + timedelta(minutes=MATCH_LENGTH_MINUTES)
-               and not t["settled"]]
-    last_upd = state["last_live_update"]
-    upd_due = (last_upd is None or now - datetime.fromisoformat(last_upd)
-               >= timedelta(minutes=LIVE_UPDATE_EVERY_MINUTES))
-    if (in_play and upd_due
-            and state["live_updates_today"] < MAX_LIVE_UPDATES_PER_DAY
-            and now.hour not in QUIET_HOURS):
-        # Skip if a kickoff "live" alert just went out in this run
-        just_live = any(f"live:{t['kickoff']:%H%M}" in state["sent_keys"]
-                        and now - t["kickoff"] < timedelta(minutes=10)
-                        for t in in_play)
-        if not just_live:
-            order = sorted(in_play, key=lambda t: not t["is_featured"])
-            do_send("live_update", f"live_update:{now:%H%M}", {
-                "live_now": len(in_play),
-                "leagues": sorted({t["league"] for t in in_play
-                                   if t["league"]})[:4],
-                "matches_you_may_name": match_names(order),
-            }, audience="live_update")
-        # Start the 45-minute clock either way
-        state["last_live_update"] = now.isoformat()
-        state["live_updates_today"] += 1 if not just_live else 0
+        if "results" not in cyc["done"]:
+            cyc["done"].append("results")
+            save_state(state)
+            slot_results(now, tips, recent_tips, state, can_send, do_send,
+                         by_package)
+        if "live" not in cyc["done"] and \
+                mins >= LIVE_SLOT_MINUTES - PULSE_SLACK_MINUTES:
+            cyc["done"].append("live")
+            save_state(state)
+            slot_live(now, tips, state, can_send, do_send, by_package)
 
     # ---------- 5. Results summary (after ALL tips are settled) ----------
     days: dict[str, list[dict]] = {}
@@ -790,6 +979,10 @@ def main() -> None:
                        key=lambda t: not t["is_featured"])),
         })
         state["summaries"].append(day)
+        state["last_results_at"] = now.isoformat()
+        # These wins are covered by the summary: don't announce them again
+        state["won_ids"] += [str(t["id"]) for t in day_tips
+                             if t["won"] and str(t["id"]) not in state["won_ids"]]
 
     # Forget statuses of tips older than yesterday
     live_ids = {str(t["id"]) for t in recent_tips}
@@ -801,6 +994,7 @@ def main() -> None:
     save_state(state)
 
     # ---------- Status report (shows in the GitHub Actions log) ----------
+    in_play = in_play_now(tips, now)
     upcoming_k = sorted({t["kickoff"] for t in tips if t["kickoff"] > now})
     print(f"Now (Nairobi): {now:%a %d %b %H:%M}"
           f"{'  [QUIET HOURS: nothing is sent]' if now.hour in QUIET_HOURS else ''}")
@@ -809,9 +1003,11 @@ def main() -> None:
           f"{len(upcoming_k)} kickoff times still ahead")
     if upcoming_k:
         print("Next kickoffs: " + ", ".join(f"{k:%H:%M}" for k in upcoming_k[:6]))
-    if state["last_live_update"]:
-        print(f"Last live update: {state['last_live_update'][11:16]} "
-              f"(next one {LIVE_UPDATE_EVERY_MINUTES} min later, if games are on)")
+    cyc = state.get("cycle") or {}
+    if cyc.get("at"):
+        st = datetime.fromisoformat(cyc["at"])
+        print(f"Cycle started {st:%H:%M}, done: {', '.join(cyc['done']) or '-'}; "
+              f"next cycle ~{st + timedelta(minutes=PULSE_EVERY_MINUTES):%H:%M}")
     print(f"Sent today: {state['sent_today']}  "
           f"(by audience: {state['sent_by_audience'] or '-'})")
     print(f"Done. {len(tips)} tips today, {state['sent_today']} sent today.")

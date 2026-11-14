@@ -18,11 +18,15 @@ Placeholders (a template is only used when all of its data exists):
   {lost}    tips lost (results)
   {pkg}     VIP package name, e.g. "VIP GG"
   {comp}    big competition in today's list, e.g. "Champions League"
+  {tw} {tl} today's record so far (won / lost)
+  {yw} {yl} yesterday's record (won / lost)
+  {streak}  wins in a row (only used when 2 or more)
 
 Used by:
   • notify.py      ready-written backup when Gemini is unavailable,
                    and style examples shown to Gemini
-  • notify_loop.py the 30-second "pulse" messages
+  • notify_loop.py banter / free-tips line when the AI has no confirmed
+                   football fact for the +30 min slot of a 45-minute cycle
 """
 
 import random
@@ -171,6 +175,24 @@ LIBRARY: dict[str, list[tuple[str, str]]] = {
          "{won} won, {lost} lost today. Open Tipsdad and check every match."),
         ("That's a wrap 🎬",
          "Today closed {won}-{lost}. Rest up: new predictions drop soon."),
+    ],
+
+    # ---------- Confidence: the real record (no new wins this cycle) ----------
+    "confidence": [
+        ("📊 Today so far: {tw} won",
+         "{tw} won, {tl} lost and {ahead} still to play. Every result is in Tipsdad History."),
+        ("Honest numbers, every day 📈",
+         "Today: {tw} won, {tl} lost. Check every match yourself in History."),
+        ("Yesterday went {yw}-{yl} ✅",
+         "Every result, won or lost, is posted in Tipsdad History. Today's list is live."),
+        ("{streak} in a row 🔥",
+         "Our last {streak} settled tips all won. See them in Tipsdad History."),
+        ("Scoreboard check 📋",
+         "Today {tw}-{tl} so far, {ahead} matches still to come. Stay with Tipsdad."),
+        ("Don't take our word for it 👀",
+         "Yesterday: {yw} won, {yl} lost. The full record is in Tipsdad History."),
+        ("Still {ahead} to play ⚽",
+         "Today stands at {tw} won, {tl} lost. Follow the rest on Tipsdad."),
     ],
 
     # ---------- VIP members: their matches are live ----------
@@ -354,7 +376,15 @@ def _data(d: dict) -> dict:
         "lost": d.get("lost"),
         "pkg": d.get("package"),
         "comp": big_competition(d.get("leagues") or []),
+        "streak": d.get("win_streak") if (d.get("win_streak") or 0) >= 2 else None,
     }
+    # Records only count when something was actually settled
+    if (d.get("today_won") or 0) + (d.get("today_lost") or 0) > 0:
+        data["tw"], data["tl"] = d.get("today_won", 0), d.get("today_lost", 0)
+    if (d.get("yesterday_won") or 0) + (d.get("yesterday_lost") or 0) > 0:
+        data["yw"], data["yl"] = d.get("yesterday_won", 0), d.get("yesterday_lost", 0)
+    if not data.get("ahead"):
+        data["ahead"] = d.get("matches_still_to_play") or None
     return {k: v for k, v in data.items() if v not in (None, "", [])}
 
 
@@ -379,6 +409,12 @@ def candidates(event: str, d: dict, now: datetime | None = None,
                            "live", "live_update"):
         pool += BIG_COMPETITION
     data = _data(d)
+    # Lines that name a weekday only on that day ("Super Sunday" on Sundays)
+    days = ["monday", "tuesday", "wednesday", "thursday", "friday",
+            "saturday", "sunday"]
+    today = days[now.weekday()]
+    pool = [t for t in pool
+            if not any(day in (t[0] + t[1]).lower() and day != today for day in days)]
     return [t for t in pool if _fields(t) <= data.keys()]
 
 
