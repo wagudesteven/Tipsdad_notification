@@ -1,45 +1,85 @@
 name: Tipsdad notifications
 
-on:
-  # Main timer: cron-job.org calls GitHub every 5 minutes with
-  # {"event_type":"tick"} (same setup as CashScore / autopush). On time.
-  repository_dispatch:
-    types: [tick]
-  # Backup only: GitHub's own timer, which often runs late or skips
-  schedule:
-    - cron: "*/15 * * * *"
-  workflow_dispatch:          # run by hand from the Actions tab
+# Runs on GitHub alone (no cron-job.org).
+#
+# GitHub's own timer is often late, so instead each run stays awake for
+# about 5h40m and runs the bot every 5 minutes on the clock (10:00, 10:05...).
+# Just before it ends it saves its memory (state.json) and starts the next
+# run itself, so it keeps going day and night.
+# The hourly timer below is only a safety net: if the chain ever stops,
+# it starts it again within an hour.
+#
+# To start it the first time: Actions -> Tipsdad notifications -> Run workflow.
+# To stop it: cancel the running run (a cancelled run doesn't start the next).
 
-# One run at a time, so nothing is sent twice
-concurrency:
-  group: tipsdad-notify
-  cancel-in-progress: false
+on:
+  workflow_dispatch:
+    inputs:
+      chain:
+        description: "Started by the previous run (leave empty)"
+        required: false
+        default: ""
+  schedule:
+    - cron: "17 * * * *"      # safety net, once an hour
+
+permissions:
+  contents: read
+  actions: write              # lets a run start the next one
 
 jobs:
   notify:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 355      # GitHub's limit is 360
+    env:
+      GH_TOKEN: ${{ github.token }}
+      LOOP_SECONDS: "20400"   # 5h40m of sending, then hand over
     steps:
+      # A safety-net or manual run quits straight away if the loop is
+      # already running, so there's never more than one.
+      - name: Already running?
+        id: check
+        run: |
+          if [ "${{ inputs.chain }}" = "1" ]; then
+            echo "busy=no" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          n=0
+          for st in in_progress queued; do
+            c=$(gh run list -R "$GITHUB_REPOSITORY" --workflow tipsdad-notify.yml \
+                  --status "$st" --json databaseId \
+                  --jq "[.[] | select(.databaseId != ${{ github.run_id }})] | length")
+            n=$(( n + ${c:-0} ))
+          done
+          if [ "${n:-0}" -gt 0 ]; then
+            echo "The notification loop is already running. Nothing to do."
+            echo "busy=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "busy=no" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/checkout@v5
+        if: steps.check.outputs.busy == 'no'
 
       - uses: actions/setup-python@v6
+        if: steps.check.outputs.busy == 'no'
         with:
           python-version: "3.12"
           cache: pip
 
-      - run: pip install -r requirements.txt
+      - if: steps.check.outputs.busy == 'no'
+        run: pip install -r requirements.txt
 
       # Load what was already sent (from the previous run)
       - uses: actions/cache/restore@v4
+        if: steps.check.outputs.busy == 'no'
         with:
           path: state.json
           key: tipsdad-state-${{ github.run_id }}
           restore-keys: tipsdad-state-
 
-      # Each cycle: 3 notifications 5 minutes apart (results / live / extra),
-      # then a 45-minute break. Plus "tips posted" when new tips are added.
-      # All times are Nairobi time.
-      - name: Send notifications
+      # Each cycle: 3 notifications 5 minutes apart, then a 45-minute break.
+      # Plus "tips posted" when new tips are added. Nairobi time.
+      - name: Send notifications (every 5 minutes)
+        if: steps.check.outputs.busy == 'no'
         env:
           FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -47,12 +87,26 @@ jobs:
           PULSE_EVERY_MINUTES: ${{ vars.PULSE_EVERY_MINUTES || '45' }}
           MAX_PER_DAY: ${{ vars.MAX_PER_DAY || '30' }}
           AI_FACTS_PER_DAY: ${{ vars.AI_FACTS_PER_DAY || '0' }}   # 0 = AI off
-        run: python notify_loop.py
+        run: |
+          end=$(( $(date +%s) + LOOP_SECONDS ))
+          while true; do
+            echo "::group::$(TZ=Africa/Nairobi date '+%H:%M') Nairobi"
+            python notify_loop.py || echo "This round failed; trying again in 5 minutes."
+            echo "::endgroup::"
+            now=$(date +%s)
+            next=$(( (now / 300 + 1) * 300 ))     # next 5-minute mark
+            if [ "$next" -ge "$end" ]; then break; fi
+            sleep $(( next - now ))
+          done
 
       # Save what was sent, even if the run failed or was stopped
-      # (skipped if the bot stopped before writing state.json)
       - uses: actions/cache/save@v4
-        if: always() && hashFiles('state.json') != ''
+        if: always() && steps.check.outputs.busy == 'no' && hashFiles('state.json') != ''
         with:
           path: state.json
           key: tipsdad-state-${{ github.run_id }}-${{ github.run_attempt }}
+
+      # Hand over to the next run (not when you cancel it yourself)
+      - name: Start the next run
+        if: (success() || failure()) && steps.check.outputs.busy == 'no'
+        run: gh workflow run tipsdad-notify.yml -R "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" -f chain=1
