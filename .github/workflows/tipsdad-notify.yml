@@ -20,9 +20,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
@@ -50,8 +50,9 @@ jobs:
         run: python notify_loop.py
 
       # Save what was sent, even if the run failed or was stopped
+      # (skipped if the bot stopped before writing state.json)
       - uses: actions/cache/save@v4
-        if: always()
+        if: always() && hashFiles('state.json') != ''
         with:
           path: state.json
-          key: tipsdad-state-${{ github.run_id }}
+          key: tipsdad-state-${{ github.run_id }}-${{ github.run_attempt }}
