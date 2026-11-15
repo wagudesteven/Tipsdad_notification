@@ -410,7 +410,8 @@ def candidates(event: str, d: dict, now: datetime | None = None,
     """Templates usable for this event and this data."""
     now = now or datetime.now()
     pool = list(LIBRARY.get(event, []))
-    if extra and event in ("tips_posted", "kickoff_soon", "next_kickoff"):
+    # Weekend lines talk about the whole day's list, so only for "tips posted"
+    if extra and event == "tips_posted":
         if now.weekday() >= 5:
             pool += WEEKEND
     if extra and event in ("tips_posted", "kickoff_soon", "next_kickoff",

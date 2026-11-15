@@ -126,6 +126,9 @@ FACT_SLOT_MINUTES = 2 * SLOT_SPACING_MINUTES
 CYCLE_MINUTES = FACT_SLOT_MINUTES + PULSE_EVERY_MINUTES             # 55
 PULSE_SLACK_MINUTES = 1          # a run can arrive a few seconds early
 MATCH_LENGTH_MINUTES = 110       # a match counts as in play this long
+# Results this long after the match's likely end are old news: they're
+# recorded silently instead of announced as "just won" / "full-time report"
+STALE_RESULT_HOURS = 6
 MAX_CONFIDENCE_PER_DAY = 30      # "here's our record" when no new wins this cycle
 SEND_KICKOFF_ALERTS = False      # True = ALSO send "kickoff soon"/"live" right at kickoff
 
@@ -666,6 +669,12 @@ def win_streak(recent_tips: list[dict]) -> int:
     return streak
 
 
+def is_stale(t: dict, now) -> bool:
+    """Match ended so long ago that its result is no longer news."""
+    return now - t["kickoff"] > timedelta(
+        minutes=MATCH_LENGTH_MINUTES, hours=STALE_RESULT_HOURS)
+
+
 def summaries_ready(now, recent_tips, state) -> list[tuple[str, list[dict]]]:
     """Days whose tips are ALL settled, unchanged for a while, not summarised yet."""
     days: dict[str, list[dict]] = {}
@@ -674,6 +683,13 @@ def summaries_ready(now, recent_tips, state) -> list[tuple[str, list[dict]]]:
     ready = []
     for day, day_tips in sorted(days.items()):
         if day in state["summaries"] or not all(t["settled"] for t in day_tips):
+            continue
+        if all(is_stale(t, now) for t in day_tips):
+            # Old day (e.g. yesterday, seen for the first time this morning):
+            # record it without a "full-time report" or "just won" alerts
+            state["summaries"].append(day)
+            state["won_ids"] += [str(t["id"]) for t in day_tips
+                                 if t["won"] and str(t["id"]) not in state["won_ids"]]
             continue
         changed = state["settle_change"].get(day)
         if changed and now - datetime.fromisoformat(changed) < \
@@ -738,6 +754,10 @@ def slot_results(now, tips, recent_tips, state, can_send, do_send,
 
     new_wins = [t for t in tips
                 if t["won"] and str(t["id"]) not in state["won_ids"]]
+    old = [t for t in new_wins if is_stale(t, now)]
+    if old:   # long-finished wins: record silently, don't say "just won"
+        state["won_ids"] += [str(t["id"]) for t in old]
+        new_wins = [t for t in new_wins if not is_stale(t, now)]
     if new_wins:
         state["won_ids"] += [str(t["id"]) for t in new_wins]
         save_state(state)
@@ -809,6 +829,8 @@ def slot_results(now, tips, recent_tips, state, can_send, do_send,
             or not can_send("confidence"):
         return
     y_rec = record_of([t for t in recent_tips if t["day"] == yesterday])
+    if state.get("yesterday_told") == today_str:
+        y_rec = {**y_rec, "won": 0, "lost": 0}   # yesterday's record: once a day
     still_to_play = sum(1 for t in tips if t["kickoff"] > now)
     if today_rec["won"] + today_rec["lost"] + y_rec["won"] + y_rec["lost"] == 0:
         return   # no record yet: the live slot covers today's matches
@@ -824,6 +846,8 @@ def slot_results(now, tips, recent_tips, state, can_send, do_send,
             [t for t in tips if t["won"]], key=lambda t: not t["is_featured"])),
     }, audience="confidence")
     state["confidence_today"] += 1
+    if y_rec["won"] + y_rec["lost"]:
+        state["yesterday_told"] = today_str
 
 
 def slot_live(now, tips, state, can_send, do_send, by_package) -> None:
