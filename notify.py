@@ -3,10 +3,11 @@ Tipsdad automatic push notifications.
 
 Run every 5 minutes (GitHub Actions or a cPanel cron). Each run:
   1. Loads today's tips from the Tipsdad API.
-  2. Every 45 minutes a cycle of up to 3 notifications, 15 minutes apart:
-       +0  "won" (tips that WON since the last cycle) or "confidence" (real record)
-       +15 "live_update" / "kickoff_soon" / "next_kickoff"
-       +30 an AI football fact about one of today's games (notify_loop.py)
+  2. Cycles of 3 notifications, 5 minutes apart, then a 45-minute break:
+       0   "won" (tips that WON since the last cycle) or "confidence" (real record)
+       +5  "live_update" / "kickoff_soon" / "next_kickoff"
+       +10 an AI football fact about one of today's games (notify_loop.py)
+     then a 45-minute break after the 3rd, and the cycle repeats.
      Plus two once-a-day messages, sent when they happen:
        • "tips posted"  – once today's tips stop changing for a while
        • "results"      – once ALL of a day's tips are settled: won/lost
@@ -29,6 +30,7 @@ It NEVER contains a tip, prediction, market or odds.
 
 import json
 import os
+import re
 import random
 import sys
 import time
@@ -53,8 +55,58 @@ STATE_FILE = os.path.join(os.path.dirname(__file__), "state.json")
 
 # Free Google Gemini model (override with a GEMINI_MODEL variable)
 AI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
+# Tried in order. If Google says a model is full (429) or retired (404),
+# the next one is tried, plus any model Google suggests in its answer.
+AI_MODELS = [AI_MODEL] + [m.strip() for m in os.getenv(
+    "GEMINI_FALLBACK_MODELS",
+    "gemini-3.8-flash,gemini-flash-lite-latest,gemini-3.8-flash-lite",
+).split(",") if m.strip() and m.strip() != AI_MODEL]
 GEMINI_URL = ("https://generativelanguage.googleapis.com/v1beta/models/"
               "{model}:generateContent")
+_good_model = None          # the model that worked last in this run
+
+
+class GeminiError(RuntimeError):
+    def __init__(self, status: int, text: str):
+        super().__init__(f"{status}: {text}")
+        self.status = status
+
+
+def gemini_error(res) -> str:
+    """Google's own explanation of an error, in one short line."""
+    try:
+        return str(res.json()["error"]["message"]).split("\n")[0][:220]
+    except Exception:
+        return res.text[:220]
+
+
+def gemini_post(payload: dict, api_key: str, timeout: int,
+                log: str = "AI: "):
+    """Send to Gemini, moving on to the next model if one is full or gone."""
+    global _good_model
+    queue = ([_good_model] if _good_model else []) + list(AI_MODELS)
+    tried, last = set(), None
+    while queue:
+        model = queue.pop(0)
+        if model in tried:
+            continue
+        tried.add(model)
+        res = requests.post(GEMINI_URL.format(model=model),
+                            headers={"x-goog-api-key": api_key},
+                            json=payload, timeout=timeout)
+        if res.ok:
+            _good_model = model
+            return res
+        why = gemini_error(res)
+        last = GeminiError(res.status_code, why)
+        if res.status_code not in (404, 429):
+            break
+        print(f"{log}{model} not usable ({res.status_code}): {why}")
+        # "...please use models/gemini-X-flash..." -> try that one next
+        hint = re.search(r"use (?:models/)?(gemini-[\w.\-]*\w)", why)
+        if hint and hint.group(1) not in tried:
+            queue.insert(0, hint.group(1))
+    raise last or GeminiError(0, "no Gemini model available")
 
 POSTED_QUIET_MINUTES = 20   # "tips posted" once no new tips for this long
 SOON_WINDOW_MINUTES = 12    # "kickoff soon" when a match starts within this
@@ -62,16 +114,19 @@ LIVE_WINDOW_MINUTES = 20    # "live" up to this long after kickoff
 MAX_PER_DAY = int(os.getenv("MAX_PER_DAY", "30"))  # cap per audience per day
 QUIET_HOURS = range(1, 7)   # no notifications 01:00–06:59 Nairobi time
 
-# Every cycle sends up to 3 notifications, spaced out:
-#   +0 min  results update (wins since last cycle, else today's record)
-#   +15 min live update    (live now / kicking off soon / next kickoff)
-#   +30 min football fact  (AI, in notify_loop.py)
-PULSE_EVERY_MINUTES = int(os.getenv("PULSE_EVERY_MINUTES", "45"))
-LIVE_SLOT_MINUTES = 15
-FACT_SLOT_MINUTES = 30
-PULSE_SLACK_MINUTES = 3          # runs are every 5 min, so allow a little early
+# The cycle: 3 notifications 5 minutes apart, then a 45-minute break.
+#   0 min   1st: results update (wins since last cycle, else today's record)
+#   +5 min  2nd: live update    (live now / kicking off soon / next kickoff)
+#   +10 min 3rd: football fact  (AI, in notify_loop.py)
+#   then wait 45 minutes after the 3rd, and start again.
+PULSE_EVERY_MINUTES = int(os.getenv("PULSE_EVERY_MINUTES", "45"))   # the break
+SLOT_SPACING_MINUTES = int(os.getenv("SLOT_SPACING_MINUTES", "5"))
+LIVE_SLOT_MINUTES = SLOT_SPACING_MINUTES
+FACT_SLOT_MINUTES = 2 * SLOT_SPACING_MINUTES
+CYCLE_MINUTES = FACT_SLOT_MINUTES + PULSE_EVERY_MINUTES             # 55
+PULSE_SLACK_MINUTES = 1          # a run can arrive a few seconds early
 MATCH_LENGTH_MINUTES = 110       # a match counts as in play this long
-MAX_CONFIDENCE_PER_DAY = 10      # "here's our record" when no new wins this cycle
+MAX_CONFIDENCE_PER_DAY = 30      # "here's our record" when no new wins this cycle
 SEND_KICKOFF_ALERTS = False      # True = ALSO send "kickoff soon"/"live" right at kickoff
 
 RESULTS_QUIET_MINUTES = 15  # results summary once statuses stop changing
@@ -134,6 +189,10 @@ AI_BUDGET_SECONDS = 90     # total AI time per run; after that, use the
 DRY_RUN = os.getenv("DRY_RUN") == "1"      # print instead of sending
 
 RUN_STARTED = time.monotonic()
+# Off: the normal notifications use the ready-written library, and Gemini is
+# kept for the daily football facts only. AI_WORDING=1 turns AI wording on.
+AI_WORDING = os.getenv("AI_WORDING", "0") == "1"
+_ai_rate_limited = False   # set after a 429; no more AI wording this run
 
 
 # ============================================================
@@ -334,8 +393,9 @@ def _examples(event: str) -> str:
 def write_message(event: str, details: dict, now: datetime,
                   recent: list[str], use_search: bool) -> dict:
     """Ask Gemini (free) for a fresh title/body. Falls back to a template."""
+    global _ai_rate_limited
     api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
+    if not api_key or not AI_WORDING or _ai_rate_limited:
         return fallback(event, details)
 
     # Out of AI time for this run: use a ready-written message
@@ -370,13 +430,7 @@ def write_message(event: str, details: dict, now: datetime,
         payload["tools"] = [{"google_search": {}}]
 
     try:
-        res = requests.post(
-            GEMINI_URL.format(model=AI_MODEL),
-            params={"key": api_key},
-            json=payload,
-            timeout=AI_TIMEOUT_SECONDS,
-        )
-        res.raise_for_status()
+        res = gemini_post(payload, api_key, AI_TIMEOUT_SECONDS)
         parts = res.json()["candidates"][0]["content"]["parts"]
         text = "".join(p.get("text", "") for p in parts)
         start, end = text.find("{"), text.rfind("}")
@@ -386,7 +440,12 @@ def write_message(event: str, details: dict, now: datetime,
         if title and body:
             return {"title": title, "body": body}
     except Exception as e:
-        print(f"AI failed, using fallback: {e}")
+        if getattr(e, "status", None) == 429:
+            # Free quota hit: stop asking for the rest of this run, so the
+            # other messages go out straight away and the fact slot keeps
+            # its share of the quota
+            _ai_rate_limited = True
+        print(f"AI failed, using fallback: {str(e).replace(api_key, '***')}")
 
     return fallback(event, details)
 
@@ -607,10 +666,72 @@ def win_streak(recent_tips: list[dict]) -> int:
     return streak
 
 
+def summaries_ready(now, recent_tips, state) -> list[tuple[str, list[dict]]]:
+    """Days whose tips are ALL settled, unchanged for a while, not summarised yet."""
+    days: dict[str, list[dict]] = {}
+    for t in recent_tips:
+        days.setdefault(t["day"], []).append(t)
+    ready = []
+    for day, day_tips in sorted(days.items()):
+        if day in state["summaries"] or not all(t["settled"] for t in day_tips):
+            continue
+        changed = state["settle_change"].get(day)
+        if changed and now - datetime.fromisoformat(changed) < \
+                timedelta(minutes=RESULTS_QUIET_MINUTES):
+            continue   # still being updated, wait a bit
+        ready.append((day, day_tips))
+    return ready
+
+
 def slot_results(now, tips, recent_tips, state, can_send, do_send,
                  by_package) -> None:
-    """+0 min: wins since the last cycle; if none, today's real record."""
+    """1st of the cycle: the day's results summary if the day just finished;
+    else wins since the last cycle; else today's real record."""
     stamp = f"cycle:{now:%Y%m%d%H%M}"
+    today_str = now.strftime("%Y-%m-%d")
+
+    # ---- a) A day just finished: results summary (+ VIP members' own wins)
+    ready = summaries_ready(now, recent_tips, state)
+    if ready and can_send():
+        for day, day_tips in ready:
+            won = sum(1 for t in day_tips if t["won"])
+            lost = sum(1 for t in day_tips if t["lost"])
+            do_send("results", f"results:{day}", {
+                "day": "today" if day == today_str else "yesterday",
+                "won": won,
+                "lost": lost,
+                "void_or_postponed": len(day_tips) - won - lost,
+                "win_rate_percent": round(won / (won + lost) * 100)
+                if won + lost else None,
+                "matches_you_may_name": match_names(
+                    sorted([t for t in day_tips if t["won"]],
+                           key=lambda t: not t["is_featured"])),
+            })
+            state["summaries"].append(day)
+            state["last_results_at"] = now.isoformat()
+
+            # Wins not announced yet: the summary covers everyone, and VIP
+            # members also get THEIR package's win in this same slot.
+            fresh = [t for t in day_tips
+                     if t["won"] and str(t["id"]) not in state["won_ids"]]
+            state["won_ids"] += [str(t["id"]) for t in fresh]
+            vip_fresh = sorted([t for t in fresh if t["entitlement"]],
+                               key=lambda t: not t["is_featured"])
+            if vip_fresh and can_send("combined"):
+                do_send("vip_won", f"{stamp}:won:{COMBINED}", {
+                    "wins_now": len(vip_fresh),
+                    "package": PACKAGE_NAME[COMBINED],
+                    "matches_you_may_name": match_names(vip_fresh),
+                }, condition=COMBINED_SUBS, audience="combined")
+            for ent, pkg_wins in by_package(vip_fresh).items():
+                if can_send(ent):
+                    do_send("vip_won", f"{stamp}:won:{ent}", {
+                        "wins_now": len(pkg_wins),
+                        "package": PACKAGE_NAME[ent],
+                        "matches_you_may_name": match_names(pkg_wins),
+                    }, condition=package_subs(ent), audience=ent)
+        save_state(state)
+        return
     yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
     in_play = in_play_now(tips, now)
     today_rec = record_of(tips)
@@ -711,7 +832,7 @@ def slot_live(now, tips, state, can_send, do_send, by_package) -> None:
     stamp = f"cycle:{now:%Y%m%d%H%M}"
     in_play = in_play_now(tips, now)
     soon = [t for t in tips if now < t["kickoff"]
-            <= now + timedelta(minutes=PULSE_EVERY_MINUTES)]
+            <= now + timedelta(minutes=CYCLE_MINUTES)]
     later = sorted((t for t in tips if t["kickoff"] > now),
                    key=lambda t: t["kickoff"])
 
@@ -916,34 +1037,11 @@ def main() -> None:
             if soon_key not in state["sent_keys"]:
                 state["sent_keys"].append(soon_key)
 
-    # ---------- 4. The 45-minute cycle (slots +0 and +15; +30 is notify_loop.py) ----------
-    if now.hour not in QUIET_HOURS:
-        cyc = state.get("cycle") or {}
-        start = datetime.fromisoformat(cyc["at"]) if cyc.get("at") else None
-        if start is None or now - start >= timedelta(
-                minutes=PULSE_EVERY_MINUTES - PULSE_SLACK_MINUTES):
-            start, cyc = now, {"at": now.isoformat(), "done": []}
-        mins = (now - start).total_seconds() / 60
-        state["cycle"] = cyc
-
-        if "results" not in cyc["done"]:
-            cyc["done"].append("results")
-            save_state(state)
-            slot_results(now, tips, recent_tips, state, can_send, do_send,
-                         by_package)
-        if "live" not in cyc["done"] and \
-                mins >= LIVE_SLOT_MINUTES - PULSE_SLACK_MINUTES:
-            cyc["done"].append("live")
-            save_state(state)
-            slot_live(now, tips, state, can_send, do_send, by_package)
-
-    # ---------- 5. Results summary (after ALL tips are settled) ----------
+    # ---------- Track result changes (the summary is sent in the cycle) ----------
     days: dict[str, list[dict]] = {}
     for t in recent_tips:
         days.setdefault(t["day"], []).append(t)
-
-    for day, day_tips in sorted(days.items()):
-        # Track when statuses last changed for this day
+    for day, day_tips in days.items():
         for t in day_tips:
             key = str(t["id"])
             status = "won" if t["won"] else "lost" if t["lost"] else \
@@ -952,37 +1050,55 @@ def main() -> None:
                 state["settled_seen"][key] = status
                 state["settle_change"][day] = now.isoformat()
 
-        if day in state["summaries"]:
-            continue
-        if not all(t["settled"] for t in day_tips):
-            continue   # history not fully updated yet
+    # ---------- 4. The cycle: 1st at 0, 2nd at +5 (3rd at +10 is notify_loop.py) ----------
+    if now.hour not in QUIET_HOURS:
+        cyc = state.get("cycle") or {}
+        start = datetime.fromisoformat(cyc["at"]) if cyc.get("at") else None
+        ended = datetime.fromisoformat(cyc["ended"]) if cyc.get("ended") else None
+        stale = start is not None and now - start > timedelta(
+            minutes=CYCLE_MINUTES + 30)      # e.g. interrupted by quiet hours
+        if (start is None or stale or (ended is not None and now - ended
+                >= timedelta(minutes=PULSE_EVERY_MINUTES - PULSE_SLACK_MINUTES))):
+            start, cyc = now, {"at": now.isoformat(), "done": []}
+        mins = (now - start).total_seconds() / 60
+        state["cycle"] = cyc
 
-        changed = state["settle_change"].get(day)
-        if changed and now - datetime.fromisoformat(changed) < \
-                timedelta(minutes=RESULTS_QUIET_MINUTES):
-            continue   # still being updated, wait a bit
+        def filler(slot: str) -> None:
+            """A slot had nothing new: send a banter / free-tips line instead,
+            so every cycle still delivers its notification."""
+            if not tips or not can_send("all"):
+                return
+            msg = messages.extras({
+                "matches": len(tips),
+                "kickoff": f"{min(t['kickoff'] for t in tips):%H:%M}",
+            })
+            if not msg:
+                return
+            send(msg, "banter", ALL_USERS)
+            state["sent_keys"].append(f"cycle:{now:%Y%m%d%H%M}:{slot}:filler")
+            state["sent_today"] += 1
+            state["sent_by_audience"]["all"] = \
+                state["sent_by_audience"].get("all", 0) + 1
+            state["recent_messages"] = (state["recent_messages"] +
+                                        [f"{msg['title']} — {msg['body']}"])[-20:]
+            save_state(state)
 
-        if not can_send():
-            continue
-
-        won = sum(1 for t in day_tips if t["won"])
-        lost = sum(1 for t in day_tips if t["lost"])
-        do_send("results", f"results:{day}", {
-            "day": "today" if day == today_str else "yesterday",
-            "won": won,
-            "lost": lost,
-            "void_or_postponed": len(day_tips) - won - lost,
-            "win_rate_percent": round(won / (won + lost) * 100)
-            if won + lost else None,
-            "matches_you_may_name": match_names(
-                sorted([t for t in day_tips if t["won"]],
-                       key=lambda t: not t["is_featured"])),
-        })
-        state["summaries"].append(day)
-        state["last_results_at"] = now.isoformat()
-        # These wins are covered by the summary: don't announce them again
-        state["won_ids"] += [str(t["id"]) for t in day_tips
-                             if t["won"] and str(t["id"]) not in state["won_ids"]]
+        if "results" not in cyc["done"]:
+            cyc["done"].append("results")
+            save_state(state)
+            before = state["sent_today"]
+            slot_results(now, tips, recent_tips, state, can_send, do_send,
+                         by_package)
+            if state["sent_today"] == before:
+                filler("results")
+        if "live" not in cyc["done"] and \
+                mins >= LIVE_SLOT_MINUTES - PULSE_SLACK_MINUTES:
+            cyc["done"].append("live")
+            save_state(state)
+            before = state["sent_today"]
+            slot_live(now, tips, state, can_send, do_send, by_package)
+            if state["sent_today"] == before:
+                filler("live")
 
     # Forget statuses of tips older than yesterday
     live_ids = {str(t["id"]) for t in recent_tips}
@@ -1006,8 +1122,11 @@ def main() -> None:
     cyc = state.get("cycle") or {}
     if cyc.get("at"):
         st = datetime.fromisoformat(cyc["at"])
+        nxt = (datetime.fromisoformat(cyc["ended"]) if cyc.get("ended")
+               else st + timedelta(minutes=FACT_SLOT_MINUTES)) + \
+            timedelta(minutes=PULSE_EVERY_MINUTES)
         print(f"Cycle started {st:%H:%M}, done: {', '.join(cyc['done']) or '-'}; "
-              f"next cycle ~{st + timedelta(minutes=PULSE_EVERY_MINUTES):%H:%M}")
+              f"next cycle ~{nxt:%H:%M}")
     print(f"Sent today: {state['sent_today']}  "
           f"(by audience: {state['sent_by_audience'] or '-'})")
     print(f"Done. {len(tips)} tips today, {state['sent_today']} sent today.")

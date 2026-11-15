@@ -4,17 +4,19 @@ Tipsdad: 3 notifications every 45 minutes.
 Runs every 5 minutes (cron-job.org + GitHub Actions). Each run:
 
   1. Runs the bot (notify.py): "tips posted", results summary, and the
-     first two slots of each 45-minute cycle, built from the app's games:
-        +0 min   results update: tips that WON since the last cycle,
+     first two notifications of each cycle, built from the app's games:
+        0 min    results update: tips that WON since the last cycle,
                  or today's real record when nothing new won
-        +15 min  live update: matches live now, kicking off soon,
+        +5 min   live update: matches live now, kicking off soon,
                  or the next kickoff later today
-  2. Sends the third slot itself:
-        +30 min  an AI football FACT about ONE of today's games, found with
+  2. Sends the third one itself:
+        +10 min  an AI football FACT about ONE of today's games, found with
                  Google Search (derby, last head-to-head, form, unbeaten
                  run, table position, milestone...). Only facts the AI
                  confirmed through search are sent. No confirmed fact ->
                  a banter line from messages.py instead.
+  3. Then a 45-minute break after the 3rd, and the cycle repeats:
+        0, 5, 10 ... (45 min) ... 55, 60, 65 ... (45 min) ... 110, 115, 120 ...
 
 No notification ever contains a tip, market, prediction or odds.
 
@@ -25,6 +27,7 @@ import json
 import os
 import random
 import re
+import time
 from datetime import datetime, timedelta
 
 import requests
@@ -40,10 +43,15 @@ import notify
 # then switch to "tipsdad" (every user).
 PULSE_TOPIC = os.getenv("PULSE_TOPIC", "tipsdad")
 
-FACT_SLOT_MINUTES = notify.FACT_SLOT_MINUTES      # +30 min into each cycle
+FACT_SLOT_MINUTES = notify.FACT_SLOT_MINUTES      # +10 min into each cycle
 SLACK = notify.PULSE_SLACK_MINUTES
 QUIET_HOURS = notify.QUIET_HOURS                  # 01:00–06:59: nothing is sent
 FACT_TIMEOUT_SECONDS = 30
+# AI football facts per day. 0 = AI OFF: Gemini is never contacted and every
+# 3rd slot is a ready-written line. Set AI_FACTS_PER_DAY=2 to turn it back on.
+# When on, facts are spread out: at least AI_FACT_GAP_MINUTES apart.
+AI_FACTS_PER_DAY = int(os.getenv("AI_FACTS_PER_DAY", "0"))
+AI_FACT_GAP_MINUTES = int(os.getenv("AI_FACT_GAP_MINUTES", "120"))
 
 # Angles the AI rotates through, so facts stay different
 ANGLES = [
@@ -147,10 +155,8 @@ def ai_fact(game: dict, angle: str, now: datetime, recent: list[str]):
         "generationConfig": {"temperature": 0.9, "maxOutputTokens": 500},
     }
     try:
-        res = requests.post(
-            notify.GEMINI_URL.format(model=notify.AI_MODEL),
-            params={"key": api_key}, json=payload, timeout=FACT_TIMEOUT_SECONDS)
-        res.raise_for_status()
+        res = notify.gemini_post(payload, api_key, FACT_TIMEOUT_SECONDS,
+                                 log="Fact: ")
         cand = res.json()["candidates"][0]
         grounding = cand.get("groundingMetadata") or {}
         searched = bool(grounding.get("groundingChunks")
@@ -159,7 +165,7 @@ def ai_fact(game: dict, angle: str, now: datetime, recent: list[str]):
         start, end = text.find("{"), text.rfind("}")
         msg = json.loads(text[start:end + 1])
     except Exception as e:
-        print(f"Fact: AI failed ({e}), using banter instead")
+        print(f"Fact: AI failed ({str(e).replace(api_key, '***')}), using banter instead")
         return None
 
     if msg.get("skip") or not searched:
@@ -204,11 +210,14 @@ def main() -> None:
     if sent >= notify.MAX_PER_DAY:
         print("Fact: daily limit reached")
         cyc["done"].append("fact")
+        cyc["ended"] = now.isoformat()
         notify.save_state(state)
         return
 
-    # Mark the slot first, so a stopped run can never send it twice
+    # Mark the slot first, so a stopped run can never send it twice.
+    # The 45-minute break is counted from here.
     cyc["done"].append("fact")
+    cyc["ended"] = now.isoformat()
     state["cycle"] = cyc
     notify.save_state(state)
 
@@ -217,10 +226,40 @@ def main() -> None:
     history = state.setdefault("fact_history", [])
     game, angle = pick_game(tips, now, history)
 
-    msg = ai_fact(game, angle, now, state["recent_messages"]) if game else None
+    # Daily AI allowance: AI_FACTS_PER_DAY facts, spread out. Failed tries
+    # count too (max twice the allowance), so a broken key can't use quota
+    # all day.
+    today = f"{now:%Y-%m-%d}"
+    facts_today = [h for h in history if h.get("day") == today]
+    tries = state.get("ai_tries") or {}
+    if tries.get("day") != today:
+        tries = {"day": today, "n": 0}
+    last_at = max((h["at"] for h in facts_today if h.get("at")), default=None)
+    wait_ok = (last_at is None or
+               (now - datetime.fromisoformat(last_at)).total_seconds() / 60
+               >= AI_FACT_GAP_MINUTES)
+    use_ai = (game is not None
+              and len(facts_today) < AI_FACTS_PER_DAY
+              and tries["n"] < 2 * AI_FACTS_PER_DAY
+              and wait_ok)
+    if game and not use_ai and AI_FACTS_PER_DAY > 0:
+        if len(facts_today) >= AI_FACTS_PER_DAY:
+            print(f"Fact: today's {AI_FACTS_PER_DAY} AI facts already sent, "
+                  "using banter")
+        elif not wait_ok:
+            print("Fact: last AI fact was less than "
+                  f"{AI_FACT_GAP_MINUTES} min ago, using banter")
+        else:
+            print("Fact: too many failed AI tries today, using banter")
+
+    msg = None
+    if use_ai:
+        tries["n"] += 1
+        state["ai_tries"] = tries
+        msg = ai_fact(game, angle, now, state["recent_messages"])
     kind = "fact"
     if msg:
-        history.append({"day": f"{now:%Y-%m-%d}",
+        history.append({"day": today, "at": now.isoformat(),
                         "match": f"{game['home']} vs {game['away']}",
                         "angle": angle})
         state["fact_history"] = history[-30:]

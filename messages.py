@@ -41,6 +41,10 @@ LIBRARY: dict[str, list[tuple[str, str]]] = {
 
     # ---------- Daily predictions / new tips posted ----------
     "tips_posted": [
+        ("Today's tips are up ⚽",
+         "Fresh analysis just landed on Tipsdad. Take a look before kickoff."),
+        ("New on Tipsdad 🆕",
+         "Today's predictions are ready. Open the app and see what we picked."),
         ("Today's slate just dropped ⚽",
          "{n} matches analysed and ready. Open Tipsdad and see where the value is today."),
         ("🚨 Fresh tips are live",
@@ -72,7 +76,7 @@ LIBRARY: dict[str, list[tuple[str, str]]] = {
         ("Tunnel walk time 🚶‍♂️",
          "Players are lining up. {n} games kick off at {kickoff}. Are you ready?"),
         ("Clock's ticking ⏱️",
-         "{match} and more start in {mins} minutes. Open Tipsdad now."),
+         "{match} starts in {mins} minutes. Open Tipsdad now."),
         ("Final call before kickoff 📣",
          "{n} matches go at {kickoff}. Check today's analysis while there's still time."),
         ("Don't be the one who missed it",
@@ -281,7 +285,7 @@ WEEKEND: list[tuple[str, str]] = [
     ("Big weekend, big decisions 👀",
      "{n} matches broken down for you. See them on Tipsdad."),
     ("No work. Just football. ⚽",
-     "{n} weekend matches are live on Tipsdad. Dive in."),
+     "{n} weekend matches are on Tipsdad. Dive in."),
 ]
 
 # Champions League, Europa, World Cup, AFCON, Euros, cup finals
@@ -385,6 +389,11 @@ def _data(d: dict) -> dict:
         data["yw"], data["yl"] = d.get("yesterday_won", 0), d.get("yesterday_lost", 0)
     if not data.get("ahead"):
         data["ahead"] = d.get("matches_still_to_play") or None
+    # Count lines are written in plural ("3 matches begin"), so a count of 1
+    # is left out and a line that doesn't need the number is used instead
+    for k in ("n", "ahead", "mins"):
+        if data.get(k) == 1:
+            data[k] = None
     return {k: v for k, v in data.items() if v not in (None, "", [])}
 
 
@@ -401,8 +410,7 @@ def candidates(event: str, d: dict, now: datetime | None = None,
     """Templates usable for this event and this data."""
     now = now or datetime.now()
     pool = list(LIBRARY.get(event, []))
-    if extra and event in ("tips_posted", "kickoff_soon", "next_kickoff",
-                           "live_update"):
+    if extra and event in ("tips_posted", "kickoff_soon", "next_kickoff"):
         if now.weekday() >= 5:
             pool += WEEKEND
     if extra and event in ("tips_posted", "kickoff_soon", "next_kickoff",
