@@ -1,9 +1,14 @@
 name: Tipsdad notifications
 
 on:
+  # Main timer: cron-job.org calls GitHub every 5 minutes with
+  # {"event_type":"tick"} (same setup as CashScore / autopush). On time.
+  repository_dispatch:
+    types: [tick]
+  # Backup only: GitHub's own timer, which often runs late or skips
   schedule:
-    - cron: "*/5 * * * *"     # every 5 minutes (GitHub's timer; can run late)
-  workflow_dispatch:          # run by hand, or by cron-job.org (reliable timer)
+    - cron: "*/15 * * * *"
+  workflow_dispatch:          # run by hand from the Actions tab
 
 # One run at a time, so nothing is sent twice
 concurrency:
@@ -31,8 +36,9 @@ jobs:
           key: tipsdad-state-${{ github.run_id }}
           restore-keys: tipsdad-state-
 
-      # Every 45 minutes: +0 results update, +15 live update, +30 AI football fact
-      # (plus "tips posted" and the end-of-day results when they happen)
+      # Each cycle: 3 notifications 5 minutes apart (results / live / extra),
+      # then a 45-minute break. Plus "tips posted" when new tips are added.
+      # All times are Nairobi time.
       - name: Send notifications
         env:
           FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
@@ -40,6 +46,7 @@ jobs:
           PULSE_TOPIC: ${{ vars.PULSE_TOPIC || 'tipsdad' }}
           PULSE_EVERY_MINUTES: ${{ vars.PULSE_EVERY_MINUTES || '45' }}
           MAX_PER_DAY: ${{ vars.MAX_PER_DAY || '30' }}
+          AI_FACTS_PER_DAY: ${{ vars.AI_FACTS_PER_DAY || '0' }}   # 0 = AI off
         run: python notify_loop.py
 
       # Save what was sent, even if the run failed or was stopped
